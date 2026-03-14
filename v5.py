@@ -163,6 +163,70 @@ def signal_stars(strength: float) -> str:
     elif strength >= 2.0: return "⭐⭐"
     else:                 return "⭐"
 
+def hs_dynamic_size(corr20: float, uvxy_chg_abs: float,
+                    recent_pnls: list, et_hour: int) -> tuple:
+    """
+    Dynamic position sizing for High-Sensitivity mode.
+    Based on real backtest analysis of 174 trades (5-day real data):
+      Corr -0.7~-0.5 → WR 74.1% → 2x
+      Corr -0.5~-0.3 → WR 64.7% → 1.5x
+      Corr -0.3~ 0   → WR 54.5% → 1x
+      Corr  < -0.7   → WR 45.6% → 0.5x (mean-reversion risk)
+      Corr  > 0      → WR 37.5% → 0x  SKIP
+    Returns (multiplier, reason, quality_label)
+    """
+    import math
+    reasons = []
+    mult    = 1.0
+
+    # ── Factor 1: 20-bar rolling correlation ─────────────────────────────
+    if math.isnan(corr20):
+        return 0.0, "相關係數數據不足", "跳過"
+    if corr20 > 0:
+        return 0.0, f"正相關({corr20:.2f})負相關失效", "跳過"
+    elif corr20 > -0.3:
+        mult *= 0.5; reasons.append(f"相關偏弱({corr20:.2f})→0.5x")
+    elif corr20 > -0.5:
+        mult *= 1.0; reasons.append(f"相關正常({corr20:.2f})→1x")
+    elif corr20 > -0.7:
+        mult *= 2.0; reasons.append(f"相關強({corr20:.2f})→2x加碼⭐")
+    else:
+        mult *= 0.5; reasons.append(f"相關極強({corr20:.2f})均值回歸→0.5x")
+
+    # ── Factor 2: Recent 10-trade rolling win rate ────────────────────────
+    if len(recent_pnls) >= 5:
+        rwr = sum(1 for p in recent_pnls[-10:] if p > 0) / min(len(recent_pnls), 10)
+        if rwr >= 0.8:
+            mult *= 0.5; reasons.append(f"近期過熱WR={rwr*100:.0f}%→0.5x")
+        elif rwr < 0.4:
+            mult *= 0.5; reasons.append(f"冷場WR={rwr*100:.0f}%→0.5x")
+        elif rwr >= 0.6:
+            mult *= 1.3; reasons.append(f"熱手WR={rwr*100:.0f}%→1.3x")
+
+    # ── Factor 3: UVXY move magnitude ────────────────────────────────────
+    if 0.25 <= uvxy_chg_abs < 0.5:
+        mult *= 1.2; reasons.append(f"UVXY大幅{uvxy_chg_abs:.2f}%→1.2x")
+    elif uvxy_chg_abs >= 0.5:
+        mult *= 0.8; reasons.append(f"UVXY極端{uvxy_chg_abs:.2f}%→0.8x")
+
+    # ── Factor 4: Time-of-day filter (ET) ────────────────────────────────
+    if et_hour in [10, 14]:
+        mult *= 0.5; reasons.append(f"{et_hour}:xx ET低勝時段→0.5x")
+
+    # Round to 0.5x steps, cap at 3x
+    mult = round(min(max(mult, 0.0), 3.0) * 2) / 2
+
+    # Quality label
+    if mult == 0:     quality = "跳過"
+    elif mult <= 0.5: quality = "⚠️ 輕倉"
+    elif mult <= 1.0: quality = "▪ 正常"
+    elif mult <= 1.5: quality = "▲ 加碼"
+    elif mult <= 2.0: quality = "⭐ 重倉"
+    else:             quality = "🔥 最重"
+
+    return mult, "  |  ".join(reasons), quality
+
+
 def vol_ratio(df: pd.DataFrame, window: int = 10) -> float:
     """Current bar volume vs rolling average."""
     if len(df) < window + 1:
@@ -185,6 +249,7 @@ defaults = {
     "last_warn_time":      None,   # Layer 1 cooldown
     "last_exit_time":      None,   # Layer 3 cooldown
     "last_hs_alert_time":  None,   # High-sensitivity cooldown
+    "hs_recent_pnls":      [],     # Rolling last 10 HS trade PnLs for dynamic sizing
     "signal_history":      [],
     "active_signal":       None,
     "active_signal_time":  None,
@@ -582,9 +647,11 @@ if data_ok:
     hs_reason      = ""
     hs_uvxy_chg    = 0.0
     hs_tsla_chg    = 0.0
+    hs_mult        = 0.0     # dynamic position size multiplier
+    hs_mult_reason = ""
+    hs_quality     = ""
 
     if use_hs_mode and len(tsla_1m) >= 2 and len(uvxy_1m) >= 2:
-        # Align last 2 candles
         common_last2 = tsla_1m.index.intersection(uvxy_1m.index)
         if len(common_last2) >= 2:
             t_closes = tsla_1m.loc[common_last2, "Close"].iloc[-2:]
@@ -595,8 +662,8 @@ if data_ok:
 
             uvxy_up_now   = hs_uvxy_chg >= hs_uvxy_min
             uvxy_down_now = hs_uvxy_chg <= -hs_uvxy_min
-            tsla_not_fell = hs_tsla_chg >= -hs_tsla_max   # TSLA didn't fall enough
-            tsla_not_rose = hs_tsla_chg <= hs_tsla_max    # TSLA didn't rise enough
+            tsla_not_fell = hs_tsla_chg >= -hs_tsla_max
+            tsla_not_rose = hs_tsla_chg <= hs_tsla_max
 
             if uvxy_up_now and tsla_not_fell:
                 hs_signal = "HS_SELL"
@@ -610,6 +677,32 @@ if data_ok:
                     f"UVXY本分鐘跌 {hs_uvxy_chg:+.3f}%，"
                     f"TSLA 僅 {hs_tsla_chg:+.3f}%（未跟升）"
                 )
+
+            # ── Dynamic sizing (runs whenever HS mode is on) ──────────────
+            import math as _math
+            # Get 20-bar rolling correlation
+            _common = tsla_1m.index.intersection(uvxy_1m.index)
+            if len(_common) >= 20:
+                _tc = tsla_1m.loc[_common, "Close"].iloc[-20:].values.astype(float)
+                _uc = uvxy_1m.loc[_common, "Close"].iloc[-20:].values.astype(float)
+                _corr20 = float(np.corrcoef(_tc, _uc)[0, 1])
+            else:
+                _corr20 = float("nan")
+
+            # ET hour
+            try:
+                import pytz as _pytz
+                _et = now.astimezone(_pytz.timezone("America/New_York"))
+                _et_hour = _et.hour
+            except Exception:
+                _et_hour = now.hour  # fallback
+
+            hs_mult, hs_mult_reason, hs_quality = hs_dynamic_size(
+                corr20       = _corr20,
+                uvxy_chg_abs = abs(hs_uvxy_chg),
+                recent_pnls  = list(st.session_state.hs_recent_pnls),
+                et_hour      = _et_hour,
+            )
 
     # ──────────────────────────────────────────────────────────────────────────
     # TELEGRAM ALERTS
@@ -693,27 +786,39 @@ if data_ok:
             f"{now.strftime('%H:%M')} 🟣 出場 {layer3_reason[:40]}"
         )
 
-    # High-sensitivity alert
+    # High-sensitivity alert (with dynamic sizing)
     if (hs_signal in ("HS_BUY", "HS_SELL")
             and cooldown_ok(st.session_state.last_hs_alert_time, hs_cooldown)):
         t_p   = float(tsla_1m["Close"].iloc[-1])
         u_p   = float(uvxy_1m["Close"].iloc[-1])
         action_hs = "⚡🟢 買入 TSLA（高敏感）" if hs_signal == "HS_BUY" else "⚡🔴 賣出 TSLA（高敏感）"
-        msg = (
-            f"*{action_hs}*\n"
-            f"━━━━━━━━━━━━━━━━\n"
-            f"時間：`{now.strftime('%Y-%m-%d %H:%M')}`\n"
-            f"模式：高敏感度（單根K線偵測）\n"
-            f"原因：{hs_reason}\n"
-            f"UVXY變動：`{hs_uvxy_chg:+.3f}%`  TSLA變動：`{hs_tsla_chg:+.3f}%`\n"
-            f"TSLA現價：`${t_p:.2f}`  UVXY現價：`${u_p:.2f}`\n"
-            f"⚠️ 高敏感模式噪音較多，請結合趨勢判斷"
-        )
+
+        if hs_mult == 0:
+            # Skipped — still log but send lighter alert
+            msg = (
+                f"⏭ *高敏感訊號跳過*\n"
+                f"時間：`{now.strftime('%Y-%m-%d %H:%M')}`\n"
+                f"原因：{hs_mult_reason}\n"
+                f"訊號：{'買TSLA' if hs_signal=='HS_BUY' else '賣TSLA'}  "
+                f"UVXY{hs_uvxy_chg:+.3f}% TSLA{hs_tsla_chg:+.3f}%"
+            )
+        else:
+            mult_emoji = "🔥" if hs_mult >= 2.5 else ("⭐" if hs_mult >= 2 else ("▲" if hs_mult >= 1.5 else "▪"))
+            msg = (
+                f"*{action_hs}*\n"
+                f"━━━━━━━━━━━━━━━━\n"
+                f"時間：`{now.strftime('%Y-%m-%d %H:%M')}`\n"
+                f"注碼建議：`{hs_mult}x` {mult_emoji}  {hs_quality}\n"
+                f"注碼依據：{hs_mult_reason}\n"
+                f"原因：{hs_reason}\n"
+                f"UVXY變動：`{hs_uvxy_chg:+.3f}%`  TSLA變動：`{hs_tsla_chg:+.3f}%`\n"
+                f"TSLA現價：`${t_p:.2f}`  UVXY現價：`${u_p:.2f}`"
+            )
         send_telegram(msg)
         st.session_state.last_hs_alert_time = now
         log = (f"{now.strftime('%H:%M')} "
                f"{'⚡🟢 HS買TSLA' if hs_signal=='HS_BUY' else '⚡🔴 HS賣TSLA'} "
-               f"UVXY{hs_uvxy_chg:+.2f}% TSLA{hs_tsla_chg:+.2f}%")
+               f"{hs_quality} {hs_mult}x  UVXY{hs_uvxy_chg:+.2f}%")
         st.session_state.signal_history.append(log)
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -777,34 +882,60 @@ if not layer1_active and not layer2_signal and not layer3_exit:
 
 # High-sensitivity signal box (shown below the main signal boxes)
 if use_hs_mode:
-    if hs_signal == "HS_BUY":
+    # Determine colors based on signal and multiplier
+    _hs_mult_color = (
+        "#b57bee" if hs_mult >= 2.5 else
+        "#00d97e" if hs_mult >= 2.0 else
+        "#5c7cfa" if hs_mult >= 1.5 else
+        "#f6c90e" if hs_mult >= 0.5 else
+        "#e84045"
+    )
+    _hs_mult_label = f"{hs_mult}x  {hs_quality}" if hs_signal else ""
+
+    if hs_signal == "HS_BUY" and hs_mult > 0:
         st.markdown(f"""
         <div style='border-radius:10px;padding:12px 20px;margin:6px 0;
                     background:#0a1a14;border:2px dashed #00d97e;text-align:center'>
           <div style='font-size:1.3rem;font-weight:800;color:#00d97e'>
-              ⚡ 高敏感 — 🟢 買入 TSLA</div>
-          <div style='font-size:0.85rem;color:#c9cdd8;margin-top:4px'>{hs_reason}</div>
+              ⚡ 高敏感 — 🟢 買入 TSLA
+              <span style='font-size:1rem;margin-left:12px;color:{_hs_mult_color}'>
+                  注碼 {_hs_mult_label}</span></div>
+          <div style='font-size:0.82rem;color:#c9cdd8;margin-top:4px'>{hs_reason}</div>
           <div style='font-size:0.75rem;color:#8b8fa8;margin-top:3px'>
-              UVXY {hs_uvxy_chg:+.3f}%　TSLA {hs_tsla_chg:+.3f}%　⚠️ 單根K線，噪音較多</div>
+              UVXY {hs_uvxy_chg:+.3f}%　TSLA {hs_tsla_chg:+.3f}%</div>
+          <div style='font-size:0.72rem;color:#5c7cfa;margin-top:3px'>{hs_mult_reason}</div>
         </div>
         """, unsafe_allow_html=True)
-    elif hs_signal == "HS_SELL":
+    elif hs_signal == "HS_SELL" and hs_mult > 0:
         st.markdown(f"""
         <div style='border-radius:10px;padding:12px 20px;margin:6px 0;
                     background:#1a0a0a;border:2px dashed #e84045;text-align:center'>
           <div style='font-size:1.3rem;font-weight:800;color:#e84045'>
-              ⚡ 高敏感 — 🔴 賣出 TSLA</div>
-          <div style='font-size:0.85rem;color:#c9cdd8;margin-top:4px'>{hs_reason}</div>
+              ⚡ 高敏感 — 🔴 賣出 TSLA
+              <span style='font-size:1rem;margin-left:12px;color:{_hs_mult_color}'>
+                  注碼 {_hs_mult_label}</span></div>
+          <div style='font-size:0.82rem;color:#c9cdd8;margin-top:4px'>{hs_reason}</div>
           <div style='font-size:0.75rem;color:#8b8fa8;margin-top:3px'>
-              UVXY {hs_uvxy_chg:+.3f}%　TSLA {hs_tsla_chg:+.3f}%　⚠️ 單根K線，噪音較多</div>
+              UVXY {hs_uvxy_chg:+.3f}%　TSLA {hs_tsla_chg:+.3f}%</div>
+          <div style='font-size:0.72rem;color:#5c7cfa;margin-top:3px'>{hs_mult_reason}</div>
         </div>
         """, unsafe_allow_html=True)
-    elif hs_signal is None and use_hs_mode:
+    elif hs_signal and hs_mult == 0:
+        st.markdown(f"""
+        <div style='border-radius:10px;padding:10px 20px;margin:6px 0;
+                    background:#1a1008;border:2px dashed #e84045;text-align:center;opacity:0.7'>
+          <div style='font-size:1rem;font-weight:700;color:#e84045'>
+              ⏭ 高敏感訊號已跳過（注碼=0）</div>
+          <div style='font-size:0.78rem;color:#8b8fa8;margin-top:4px'>{hs_mult_reason}</div>
+        </div>
+        """, unsafe_allow_html=True)
+    elif hs_signal is None:
         st.markdown(f"""
         <div style='border-radius:10px;padding:10px 20px;margin:6px 0;
                     background:#111316;border:1px dashed #2d3139;text-align:center'>
           <div style='font-size:0.9rem;color:#8b8fa8'>
-              ⚡ 高敏感模式監測中…　UVXY={hs_uvxy_chg:+.3f}%　TSLA={hs_tsla_chg:+.3f}%</div>
+              ⚡ 高敏感監測中…　UVXY={hs_uvxy_chg:+.3f}%　TSLA={hs_tsla_chg:+.3f}%
+              　注碼評分：<span style='color:{_hs_mult_color}'>{hs_mult_reason if hs_mult_reason else "待訊號"}</span></div>
         </div>
         """, unsafe_allow_html=True)
 
