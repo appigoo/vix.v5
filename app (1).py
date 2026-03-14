@@ -1,25 +1,919 @@
-import gradio as gr
+import streamlit as st
 import yfinance as yf
 import pandas as pd
-import ta
+import numpy as np
+import plotly.graph_objects as go
+from scipy.stats import linregress
+from datetime import datetime
+import time
+import requests
 
-def analyze(symbol):
+# ═══════════════════════════════════════════════════════════════════════════════
+# PAGE CONFIG
+# ═══════════════════════════════════════════════════════════════════════════════
+st.set_page_config(page_title="TSLA vs UVXY 三層訊號系統", page_icon="🎯", layout="wide")
 
-    df = yf.download(symbol, period="3mo")
+# ═══════════════════════════════════════════════════════════════════════════════
+# CSS
+# ═══════════════════════════════════════════════════════════════════════════════
+st.markdown("""
+<style>
+  .main { background-color: #0e1117; }
 
-    macd = ta.trend.MACD(df["Close"])
+  /* ── Metric cards ── */
+  .metric-card {
+      background:#1c1f26; border-radius:10px; padding:13px 15px;
+      border:1px solid #2d3139; text-align:center; height:100%;
+  }
+  .metric-label { color:#8b8fa8; font-size:0.68rem; letter-spacing:0.06em; text-transform:uppercase; }
+  .metric-value { font-size:1.35rem; font-weight:700; margin-top:4px; line-height:1.2; }
+  .metric-sub   { font-size:0.75rem; font-weight:600; margin-top:3px; }
 
-    df["macd"] = macd.macd()
+  /* ── Signal boxes ── */
+  .sig-layer1 {
+      border-radius:12px; padding:14px 20px; margin:6px 0;
+      background:#2b2200; border:2px solid #f6c90e; text-align:center;
+  }
+  .sig-layer2-buy {
+      border-radius:12px; padding:16px 20px; margin:6px 0;
+      background:#0a2b16; border:2px solid #00d97e; text-align:center;
+  }
+  .sig-layer2-sell {
+      border-radius:12px; padding:16px 20px; margin:6px 0;
+      background:#2b0a0a; border:2px solid #e84045; text-align:center;
+  }
+  .sig-layer3 {
+      border-radius:12px; padding:14px 20px; margin:6px 0;
+      background:#1a0a2b; border:2px solid #b57bee; text-align:center;
+  }
+  .sig-normal {
+      border-radius:12px; padding:12px 20px; margin:6px 0;
+      background:#1c1f26; border:1px solid #2d3139; text-align:center;
+  }
+  .sig-title  { font-size:1.5rem; font-weight:800; }
+  .sig-detail { font-size:0.87rem; color:#c9cdd8; margin-top:5px; line-height:1.5; }
 
-    signal = "BUY" if df["macd"].iloc[-1] > 0 else "SELL"
+  /* ── Section titles ── */
+  .section-title {
+      font-size:0.92rem; font-weight:700; color:#c9cdd8;
+      border-left:3px solid #5c7cfa; padding-left:8px; margin:18px 0 8px 0;
+  }
 
-    return f"{symbol} signal: {signal}"
+  /* ── Track bar ── */
+  .track-card {
+      background:#161920; border-radius:8px; padding:10px 14px;
+      border:1px solid #2d3139; margin:4px 0; font-size:0.82rem; color:#c9cdd8;
+  }
 
-demo = gr.Interface(
-    fn=analyze,
-    inputs="text",
-    outputs="text",
-    title="AI Stock Analyzer"
+  /* ── SPY badge ── */
+  .spy-on  { background:#0a2020; border:1px solid #00d97e; border-radius:6px;
+             padding:4px 10px; color:#00d97e; font-size:0.78rem; font-weight:700; }
+  .spy-off { background:#1c1f26; border:1px solid #2d3139; border-radius:6px;
+             padding:4px 10px; color:#8b8fa8; font-size:0.78rem; }
+</style>
+""", unsafe_allow_html=True)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TELEGRAM
+# ═══════════════════════════════════════════════════════════════════════════════
+def send_telegram(message: str):
+    try:
+        token   = st.secrets["telegram"]["bot_token"]
+        chat_id = st.secrets["telegram"]["chat_id"]
+        requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": message, "parse_mode": "Markdown"},
+            timeout=8,
+        )
+    except Exception as e:
+        st.sidebar.warning(f"Telegram 失敗: {e}")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# DATA FETCH
+# ═══════════════════════════════════════════════════════════════════════════════
+@st.cache_data(ttl=55)
+def fetch_1m(ticker: str, bars: int = 80) -> pd.DataFrame:
+    df = yf.download(ticker, period="1d", interval="1m", progress=False, auto_adjust=True)
+    if df.empty:
+        return df
+    df = df.tail(bars).copy()
+    df.index = pd.to_datetime(df.index)
+    df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+    return df
+
+@st.cache_data(ttl=290)
+def fetch_5m(ticker: str, bars: int = 30) -> pd.DataFrame:
+    df = yf.download(ticker, period="5d", interval="5m", progress=False, auto_adjust=True)
+    if df.empty:
+        return df
+    df = df.tail(bars).copy()
+    df.index = pd.to_datetime(df.index)
+    df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+    return df
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TREND ENGINE
+# ═══════════════════════════════════════════════════════════════════════════════
+def calc_trend(prices: pd.Series, consec_required: int = 2) -> dict:
+    """
+    Linear regression trend analysis.
+    Returns: slope (%/bar), r2, direction (+1/-1/0),
+             consecutive (tail candles same direction),
+             confirmed (bool), pct_move (first→last %)
+    """
+    n = len(prices)
+    if n < 3:
+        return dict(slope=0, r2=0, direction=0, consecutive=0, confirmed=False, pct_move=0)
+    x = np.arange(n, dtype=float)
+    y = prices.values.astype(float)
+    slope, intercept, r, p, se = linregress(x, y)
+    r2        = r ** 2
+    norm_slope = (slope / float(np.mean(y))) * 100
+    diffs     = np.diff(y)
+    last_sign = np.sign(diffs[-1])
+    consec    = 1
+    for d in reversed(diffs[:-1]):
+        if np.sign(d) == last_sign and last_sign != 0:
+            consec += 1
+        else:
+            break
+    direction = int(np.sign(norm_slope))
+    confirmed = (consec >= consec_required) and (r2 >= 0.45)
+    pct_move  = (y[-1] - y[0]) / y[0] * 100
+    return dict(slope=norm_slope, r2=r2, direction=direction,
+                consecutive=consec, confirmed=confirmed, pct_move=pct_move)
+
+def resistance_ratio(uvxy_pct: float, tsla_pct: float) -> float:
+    """
+    How much TSLA resisted UVXY's move.
+    UVXY up +1%, TSLA only down -0.1% → ratio = 0.1 (strong resistance)
+    Perfect negative correlation → ratio = 1.0
+    Returns 0–∞ (lower = stronger resistance when directions oppose)
+    """
+    if abs(uvxy_pct) < 0.01:
+        return 1.0
+    expected_tsla = -uvxy_pct          # perfect negative correlation
+    actual_tsla   = tsla_pct
+    # ratio of actual response vs expected response
+    ratio = abs(actual_tsla) / abs(expected_tsla)
+    return round(ratio, 3)
+
+def signal_stars(strength: float) -> str:
+    if strength >= 4.0:   return "⭐⭐⭐"
+    elif strength >= 2.0: return "⭐⭐"
+    else:                 return "⭐"
+
+def vol_ratio(df: pd.DataFrame, window: int = 10) -> float:
+    """Current bar volume vs rolling average."""
+    if len(df) < window + 1:
+        return 1.0
+    vols = df["Volume"].values.astype(float)
+    avg  = float(np.mean(vols[-(window+1):-1]))
+    curr = float(vols[-1])
+    return curr / avg if avg > 0 else 1.0
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SESSION STATE
+# ═══════════════════════════════════════════════════════════════════════════════
+def _empty_corr():
+    return pd.DataFrame({"time": pd.Series(dtype="datetime64[ns]"),
+                         "corr": pd.Series(dtype="float64")})
+
+defaults = {
+    "corr_history":        _empty_corr(),
+    "last_alert_time":     None,
+    "last_warn_time":      None,   # Layer 1 cooldown
+    "last_exit_time":      None,   # Layer 3 cooldown
+    "signal_history":      [],
+    "active_signal":       None,
+    "active_signal_time":  None,
+    "active_signal_entry": None,   # entry price when signal fired
+}
+for k, v in defaults.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
+if not isinstance(st.session_state.corr_history, pd.DataFrame):
+    st.session_state.corr_history = _empty_corr()
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SIDEBAR
+# ═══════════════════════════════════════════════════════════════════════════════
+with st.sidebar:
+    st.markdown("## ⚙️ 控制面板")
+
+    display_bars   = st.slider("K線顯示數量",             10, 40, 20)
+    consec_req     = st.slider("UVXY 連續確認根數",         2,  5,  2)
+    cooldown_min   = st.slider("Telegram 冷卻（分鐘）",    1, 30,  5)
+    signal_timeout = st.slider("訊號追蹤失效（分鐘）",     5, 60, 20)
+
+    st.divider()
+    st.markdown("### 📐 靈敏度")
+    min_uvxy_slope     = st.slider("UVXY 最低斜率 (%/根)",        0.05, 1.0,  0.15, step=0.05)
+    min_tsla_response  = st.slider("TSLA 視為已反應 (%)",          0.1,  2.0,  0.30, step=0.1)
+    resistance_thresh  = st.slider("抵抗力比值門檻（Layer1）",     0.05, 0.8,  0.30, step=0.05,
+                                    help="TSLA跌幅÷UVXY升幅，低於此值觸發預警")
+    rsi_overbought     = st.slider("RSI 超買出場閾值（Layer3）",   65,   85,   70)
+    vol_spike_mult     = st.slider("成交量爆增倍數（Layer3）",      1.5,  5.0,  2.5, step=0.5)
+
+    st.divider()
+
+    # ── SPY Filter Toggle ──────────────────────────────────────────────────────
+    st.markdown("### 🔍 SPY 大盤過濾")
+    use_spy_filter = st.toggle(
+        "啟用 SPY 過濾",
+        value=False,
+        help="開啟後：若 SPY 同步下跌確認，BUY_TSLA 訊號會被降級或過濾，避免大盤拖累假訊號"
+    )
+    if use_spy_filter:
+        spy_filter_strength = st.radio(
+            "過濾強度",
+            ["寬鬆（降低訊號強度）", "嚴格（直接過濾訊號）"],
+            index=0,
+        )
+        st.markdown("<div class='spy-on'>✅ SPY 過濾已啟用</div>", unsafe_allow_html=True)
+    else:
+        st.markdown("<div class='spy-off'>○ SPY 過濾已關閉</div>", unsafe_allow_html=True)
+
+    st.divider()
+    auto_refresh = st.toggle("每分鐘自動刷新", value=True)
+    if st.button("🔄 立即刷新"):
+        st.cache_data.clear()
+        st.rerun()
+
+    st.divider()
+    st.markdown("### 📋 訊號紀錄")
+    if st.session_state.signal_history:
+        for entry in reversed(st.session_state.signal_history[-15:]):
+            if "🟢" in entry or "兌現" in entry:
+                color = "#00d97e"
+            elif "🔴" in entry or "出場" in entry:
+                color = "#e84045"
+            elif "🟡" in entry:
+                color = "#f6c90e"
+            elif "紫" in entry or "exit" in entry.lower():
+                color = "#b57bee"
+            else:
+                color = "#8b8fa8"
+            st.markdown(
+                f"<div style='color:{color};font-size:0.76rem;margin:2px 0'>{entry}</div>",
+                unsafe_allow_html=True,
+            )
+    else:
+        st.markdown("<small style='color:#8b8fa8'>尚無訊號</small>", unsafe_allow_html=True)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# HEADER
+# ═══════════════════════════════════════════════════════════════════════════════
+st.markdown("# 🎯 TSLA vs UVXY 三層訊號系統")
+spy_badge = (
+    "<span class='spy-on'>SPY過濾 ON</span>" if use_spy_filter
+    else "<span class='spy-off'>SPY過濾 OFF</span>"
+)
+st.markdown(
+    f"<small style='color:#8b8fa8'>預警 → 入場 → 出場 三層架構 · 抵抗力偵測 · 多框架趨勢引擎</small> &nbsp; {spy_badge}",
+    unsafe_allow_html=True,
+)
+st.divider()
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# FETCH DATA
+# ═══════════════════════════════════════════════════════════════════════════════
+tickers_to_fetch = ["TSLA", "UVXY"]
+if use_spy_filter:
+    tickers_to_fetch.append("SPY")
+
+with st.spinner("載入市場數據…"):
+    tsla_1m = fetch_1m("TSLA", bars=max(display_bars + 20, 80))
+    uvxy_1m = fetch_1m("UVXY", bars=max(display_bars + 20, 80))
+    tsla_5m = fetch_5m("TSLA", bars=30)
+    uvxy_5m = fetch_5m("UVXY", bars=30)
+    spy_1m  = fetch_1m("SPY",  bars=max(display_bars + 20, 80)) if use_spy_filter else pd.DataFrame()
+
+data_ok = not tsla_1m.empty and not uvxy_1m.empty
+now     = datetime.now()
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ANALYSIS ENGINE
+# ═══════════════════════════════════════════════════════════════════════════════
+# Output variables
+layer1_active    = False   # Warning: TSLA resisting UVXY rise
+layer2_signal    = None    # "BUY_TSLA" | "SELL_TSLA" | None
+layer3_exit      = False   # Exit signal
+layer2_stars     = ""
+layer2_strength  = 0.0
+layer1_reason    = ""
+layer2_reason    = ""
+layer3_reason    = ""
+spy_filtered     = False   # Whether SPY filter suppressed a signal
+
+uvxy_trend_1m   = {}
+tsla_trend_1m   = {}
+uvxy_trend_5m   = {}
+tsla_trend_5m   = {}
+spy_trend_1m    = {}
+corr_value      = None
+multi_tf_agree  = False
+res_ratio       = 1.0
+tsla_rsi1       = None
+tsla_vol_ratio  = 1.0
+
+if data_ok:
+    # ── Pearson correlation ───────────────────────────────────────────────────
+    common_1m = tsla_1m.index.intersection(uvxy_1m.index)
+    if len(common_1m) >= 10:
+        corr_value = float(tsla_1m.loc[common_1m, "Close"].corr(
+                            uvxy_1m.loc[common_1m, "Close"]))
+        new_row  = pd.DataFrame({"time": [pd.Timestamp(now)], "corr": [corr_value]})
+        existing = st.session_state.corr_history
+        if not isinstance(existing, pd.DataFrame):
+            existing = _empty_corr()
+        st.session_state.corr_history = pd.concat(
+            [existing, new_row], ignore_index=True
+        ).tail(120).reset_index(drop=True)
+
+    # ── Trend calculations ────────────────────────────────────────────────────
+    uvxy_trend_1m = calc_trend(uvxy_1m["Close"].tail(display_bars), consec_req)
+    tsla_trend_1m = calc_trend(tsla_1m["Close"].tail(display_bars), consec_req)
+    if not tsla_5m.empty and not uvxy_5m.empty:
+        uvxy_trend_5m = calc_trend(uvxy_5m["Close"].tail(12), consec_req)
+        tsla_trend_5m = calc_trend(tsla_5m["Close"].tail(12), consec_req)
+    if use_spy_filter and not spy_1m.empty:
+        spy_trend_1m = calc_trend(spy_1m["Close"].tail(display_bars), consec_req)
+
+    uvxy_dir       = uvxy_trend_1m.get("direction", 0)
+    uvxy_confirmed = uvxy_trend_1m.get("confirmed", False)
+    uvxy_slope_ok  = abs(uvxy_trend_1m.get("slope", 0)) >= min_uvxy_slope
+    uvxy_5m_dir    = uvxy_trend_5m.get("direction", 0) if uvxy_trend_5m else 0
+    multi_tf_agree = (uvxy_dir != 0) and (uvxy_5m_dir == uvxy_dir)
+
+    tsla_pct       = tsla_trend_1m.get("pct_move", 0)
+    uvxy_pct       = uvxy_trend_1m.get("pct_move", 0)
+    tsla_responded = (
+        abs(tsla_pct) >= min_tsla_response and
+        int(np.sign(tsla_pct)) == -uvxy_dir
+    )
+
+    # ── Resistance ratio ──────────────────────────────────────────────────────
+    # Only meaningful when UVXY is rising and TSLA should be falling
+    if uvxy_dir == +1 and uvxy_pct > 0.1:
+        res_ratio = resistance_ratio(uvxy_pct, tsla_pct)
+
+    # ── Simple RSI-14 for TSLA ────────────────────────────────────────────────
+    closes = tsla_1m["Close"].values.astype(float)
+    if len(closes) >= 15:
+        deltas = np.diff(closes[-15:])
+        gains  = deltas[deltas > 0]
+        losses = -deltas[deltas < 0]
+        avg_g  = float(np.mean(gains))  if len(gains)  > 0 else 0.0
+        avg_l  = float(np.mean(losses)) if len(losses) > 0 else 0.0
+        if avg_l == 0:
+            tsla_rsi1 = 100.0
+        else:
+            rs        = avg_g / avg_l
+            tsla_rsi1 = round(100 - 100 / (1 + rs), 2)
+
+    # ── Volume spike ─────────────────────────────────────────────────────────
+    if "Volume" in tsla_1m.columns:
+        tsla_vol_ratio = vol_ratio(tsla_1m, window=10)
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # LAYER 1: WARNING — TSLA resistance while UVXY is rising
+    # Condition: UVXY confirmed up + TSLA barely moves (resistance ratio low)
+    # ──────────────────────────────────────────────────────────────────────────
+    if (uvxy_confirmed and uvxy_slope_ok and uvxy_dir == +1
+            and res_ratio < resistance_thresh and not tsla_responded):
+        layer1_active = True
+        layer1_reason = (
+            f"UVXY 升 {uvxy_pct:+.2f}%（斜率{uvxy_trend_1m['slope']:+.3f}%/根 R²={uvxy_trend_1m['r2']:.2f}）"
+            f"　TSLA 僅 {tsla_pct:+.2f}%　抵抗力比值={res_ratio:.2f}（< {resistance_thresh}）"
+        )
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # LAYER 2: ENTRY SIGNAL
+    # Case A (BUY): UVXY confirmed DOWN + TSLA not yet risen
+    # Case B (BUY enhanced): UVXY was UP, now turning DOWN (pivot) + TSLA still strong
+    # Case C (SELL): UVXY confirmed UP + TSLA not yet fallen
+    # ──────────────────────────────────────────────────────────────────────────
+    if uvxy_confirmed and uvxy_slope_ok and uvxy_dir != 0:
+        base_strength = (
+            abs(uvxy_trend_1m["slope"])
+            + uvxy_trend_1m["r2"]
+            + uvxy_trend_1m["consecutive"] * 0.3
+        ) * (1.5 if multi_tf_agree else 1.0)
+
+        if uvxy_dir == -1 and not tsla_responded:
+            # Standard BUY: UVXY falling, TSLA lagging
+            layer2_signal   = "BUY_TSLA"
+            layer2_strength = base_strength
+            tf_tag = "【1m+5m✓】" if multi_tf_agree else "【1m】"
+
+            # Boost if Layer 1 was recently active (resistance confirmed before drop)
+            if layer1_active or res_ratio < resistance_thresh:
+                layer2_strength *= 1.8
+                tf_tag += "【抵抗力確認⭐】"
+
+            layer2_reason = (
+                f"{tf_tag} UVXY跌 {uvxy_pct:+.2f}%  斜率{uvxy_trend_1m['slope']:+.3f}%/根  "
+                f"R²={uvxy_trend_1m['r2']:.2f}  連{uvxy_trend_1m['consecutive']}根 | "
+                f"TSLA 僅 {tsla_pct:+.2f}% 尚未反應"
+            )
+
+        elif uvxy_dir == +1 and not tsla_responded:
+            # SELL: UVXY rising, TSLA not yet falling
+            layer2_signal   = "SELL_TSLA"
+            layer2_strength = base_strength
+            tf_tag = "【1m+5m✓】" if multi_tf_agree else "【1m】"
+            layer2_reason = (
+                f"{tf_tag} UVXY升 {uvxy_pct:+.2f}%  斜率{uvxy_trend_1m['slope']:+.3f}%/根  "
+                f"R²={uvxy_trend_1m['r2']:.2f}  連{uvxy_trend_1m['consecutive']}根 | "
+                f"TSLA 僅 {tsla_pct:+.2f}% 尚未跟跌"
+            )
+
+    layer2_stars = signal_stars(layer2_strength)
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # SPY FILTER — applied to BUY_TSLA only
+    # ──────────────────────────────────────────────────────────────────────────
+    if use_spy_filter and layer2_signal == "BUY_TSLA" and spy_trend_1m:
+        spy_dir       = spy_trend_1m.get("direction", 0)
+        spy_confirmed = spy_trend_1m.get("confirmed", False)
+        spy_pct       = spy_trend_1m.get("pct_move", 0)
+
+        if spy_confirmed and spy_dir == -1:
+            if "嚴格" in spy_filter_strength:
+                # Hard filter: cancel signal
+                layer2_signal = None
+                spy_filtered  = True
+                layer2_reason = (
+                    f"⛔ SPY過濾（嚴格）：SPY跌 {spy_pct:+.2f}% 確認下跌趨勢，"
+                    f"TSLA跌可能是大盤拖累，非純UVXY滯後訊號"
+                )
+            else:
+                # Soft filter: reduce strength and add warning
+                layer2_strength *= 0.5
+                layer2_stars     = signal_stars(layer2_strength)
+                spy_filtered     = True
+                layer2_reason   += (
+                    f"  ⚠️ SPY過濾（寬鬆）：SPY跌 {spy_pct:+.2f}%，訊號強度已降半"
+                )
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # LAYER 3: EXIT SIGNAL
+    # Condition: RSI overbought OR volume spike red candle OR UVXY reversal up
+    # ──────────────────────────────────────────────────────────────────────────
+    exit_reasons = []
+
+    if tsla_rsi1 is not None and tsla_rsi1 >= rsi_overbought:
+        exit_reasons.append(f"RSI={tsla_rsi1:.1f} 超買（>{rsi_overbought}）")
+
+    if tsla_vol_ratio >= vol_spike_mult:
+        last_close = float(tsla_1m["Close"].iloc[-1])
+        last_open  = float(tsla_1m["Open"].iloc[-1])
+        if last_close < last_open:   # red candle
+            exit_reasons.append(f"成交量爆增{tsla_vol_ratio:.1f}×且收黑K")
+
+    # UVXY reversal: was falling, now turning up strongly
+    if (st.session_state.active_signal == "BUY_TSLA"
+            and uvxy_dir == +1 and uvxy_confirmed):
+        exit_reasons.append(f"UVXY反轉上升（斜率{uvxy_trend_1m['slope']:+.3f}%/根）")
+
+    if exit_reasons:
+        layer3_exit   = True
+        layer3_reason = "  ·  ".join(exit_reasons)
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # ACTIVE SIGNAL TRACKING
+    # ──────────────────────────────────────────────────────────────────────────
+    if layer2_signal in ("BUY_TSLA", "SELL_TSLA"):
+        if st.session_state.active_signal != layer2_signal:
+            st.session_state.active_signal      = layer2_signal
+            st.session_state.active_signal_time = now
+            st.session_state.active_signal_entry = float(tsla_1m["Close"].iloc[-1])
+        else:
+            elapsed = (now - st.session_state.active_signal_time).total_seconds() / 60
+            t_now   = float(tsla_1m["Close"].iloc[-1])
+            pnl     = ((t_now - st.session_state.active_signal_entry)
+                       / st.session_state.active_signal_entry * 100
+                       * (1 if layer2_signal == "BUY_TSLA" else -1))
+
+            if layer3_exit:
+                st.session_state.signal_history.append(
+                    f"{now.strftime('%H:%M')} 🟣 出場 "
+                    f"{'買' if layer2_signal=='BUY_TSLA' else '賣'}TSLA "
+                    f"持{elapsed:.0f}min  P&L≈{pnl:+.2f}%  {layer3_reason[:30]}"
+                )
+                st.session_state.active_signal = None
+            elif elapsed > signal_timeout:
+                st.session_state.signal_history.append(
+                    f"{now.strftime('%H:%M')} ❌ 失效 "
+                    f"{'買' if layer2_signal=='BUY_TSLA' else '賣'}TSLA "
+                    f"超{signal_timeout}min未反應"
+                )
+                st.session_state.active_signal = None
+            elif abs(pnl) > 0 and (
+                (layer2_signal == "BUY_TSLA"  and pnl > 0) or
+                (layer2_signal == "SELL_TSLA" and pnl > 0)
+            ):
+                # Mark as fulfilled when TSLA has actually moved
+                if tsla_responded:
+                    st.session_state.signal_history.append(
+                        f"{now.strftime('%H:%M')} ✅ 兌現 "
+                        f"{'買' if layer2_signal=='BUY_TSLA' else '賣'}TSLA "
+                        f"持{elapsed:.0f}min  P&L≈{pnl:+.2f}%"
+                    )
+    else:
+        if layer3_exit and st.session_state.active_signal:
+            t_now  = float(tsla_1m["Close"].iloc[-1])
+            entry  = st.session_state.active_signal_entry or t_now
+            elapsed = (now - (st.session_state.active_signal_time or now)).total_seconds() / 60
+            pnl    = (t_now - entry) / entry * 100
+            st.session_state.signal_history.append(
+                f"{now.strftime('%H:%M')} 🟣 出場 持{elapsed:.0f}min P&L≈{pnl:+.2f}%"
+            )
+            st.session_state.active_signal = None
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # TELEGRAM ALERTS
+    # ──────────────────────────────────────────────────────────────────────────
+    def cooldown_ok(last_time, minutes):
+        return (last_time is None or
+                (now - last_time).total_seconds() > minutes * 60)
+
+    # Layer 1 warning alert
+    if layer1_active and cooldown_ok(st.session_state.last_warn_time, max(1, cooldown_min // 2)):
+        t_p = float(tsla_1m["Close"].iloc[-1])
+        u_p = float(uvxy_1m["Close"].iloc[-1])
+        msg = (
+            f"🟡 *TSLA 抵抗力預警（Layer 1）*\n"
+            f"━━━━━━━━━━━━━━━━\n"
+            f"時間：`{now.strftime('%Y-%m-%d %H:%M')}`\n"
+            f"UVXY升 `{uvxy_pct:+.2f}%` 但TSLA僅 `{tsla_pct:+.2f}%`\n"
+            f"抵抗力比值：`{res_ratio:.2f}`（門檻<{resistance_thresh}）\n"
+            f"TSLA：`${t_p:.2f}`  UVXY：`${u_p:.2f}`\n"
+            f"⚡ 若UVXY轉跌，TSLA可能急升"
+        )
+        send_telegram(msg)
+        st.session_state.last_warn_time = now
+        st.session_state.signal_history.append(
+            f"{now.strftime('%H:%M')} 🟡 預警 UVXY升{uvxy_pct:+.1f}% TSLA抵抗{res_ratio:.2f}"
+        )
+
+    # Layer 2 entry alert
+    if (layer2_signal in ("BUY_TSLA", "SELL_TSLA")
+            and cooldown_ok(st.session_state.last_alert_time, cooldown_min)):
+        action = "🟢 買入 TSLA" if layer2_signal == "BUY_TSLA" else "🔴 賣出 TSLA"
+        t_p    = float(tsla_1m["Close"].iloc[-1])
+        u_p    = float(uvxy_1m["Close"].iloc[-1])
+        spy_line = ""
+        if use_spy_filter and spy_trend_1m:
+            spy_pct_val = spy_trend_1m.get("pct_move", 0)
+            spy_line = f"SPY過濾：{'⛔已過濾降級' if spy_filtered else '✅未觸發'}（SPY{spy_pct_val:+.2f}%）\n"
+        tf_line = "✅ 1m+5m 雙框架" if multi_tf_agree else "⚠️ 僅1m框架"
+        msg = (
+            f"*{action}*  {layer2_stars}\n"
+            f"━━━━━━━━━━━━━━━━\n"
+            f"時間：`{now.strftime('%Y-%m-%d %H:%M')}`\n"
+            f"框架：{tf_line}\n"
+            f"{spy_line}"
+            f"UVXY斜率：`{uvxy_trend_1m.get('slope',0):+.3f}%/根`  "
+            f"R²=`{uvxy_trend_1m.get('r2',0):.2f}`  "
+            f"連續`{uvxy_trend_1m.get('consecutive',0)}`根\n"
+            f"TSLA未反應：`{tsla_pct:+.2f}%`\n"
+            f"訊號強度：`{layer2_strength:.2f}` {layer2_stars}\n"
+            f"入場參考：TSLA `${t_p:.2f}`  UVXY `${u_p:.2f}`"
+        )
+        send_telegram(msg)
+        st.session_state.last_alert_time = now
+        spy_tag = " [SPY↓降級]" if spy_filtered else ""
+        st.session_state.signal_history.append(
+            f"{now.strftime('%H:%M')} "
+            f"{'🟢 買TSLA' if layer2_signal=='BUY_TSLA' else '🔴 賣TSLA'} "
+            f"{layer2_stars} 強度{layer2_strength:.1f}{spy_tag}"
+        )
+
+    # Layer 3 exit alert
+    if layer3_exit and cooldown_ok(st.session_state.last_exit_time, 2):
+        t_p   = float(tsla_1m["Close"].iloc[-1])
+        entry = st.session_state.active_signal_entry
+        pnl_str = ""
+        if entry:
+            pnl = (t_p - entry) / entry * 100
+            pnl_str = f"P&L估算：`{pnl:+.2f}%`\n"
+        msg = (
+            f"🟣 *出場訊號（Layer 3）*\n"
+            f"━━━━━━━━━━━━━━━━\n"
+            f"時間：`{now.strftime('%Y-%m-%d %H:%M')}`\n"
+            f"原因：{layer3_reason}\n"
+            f"{pnl_str}"
+            f"TSLA現價：`${t_p:.2f}`\n"
+            f"RSI：`{tsla_rsi1:.1f}`  成交量倍數：`{tsla_vol_ratio:.1f}×`"
+        )
+        send_telegram(msg)
+        st.session_state.last_exit_time = now
+        st.session_state.signal_history.append(
+            f"{now.strftime('%H:%M')} 🟣 出場 {layer3_reason[:40]}"
+        )
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SIGNAL DISPLAY — THREE LAYERS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Layer 3 exit (top priority display)
+if layer3_exit:
+    st.markdown(f"""
+    <div class="sig-layer3">
+      <div class="sig-title" style="color:#b57bee">🟣 出場訊號（Layer 3）</div>
+      <div class="sig-detail">{layer3_reason}<br>
+      RSI={tsla_rsi1:.1f if tsla_rsi1 else '—'}  成交量={tsla_vol_ratio:.1f}×</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+# Layer 2 entry signal
+if layer2_signal == "BUY_TSLA":
+    spy_note = f"<br><small style='color:#f6c90e'>⚠️ SPY過濾已降級訊號強度</small>" if spy_filtered else ""
+    st.markdown(f"""
+    <div class="sig-layer2-buy">
+      <div class="sig-title" style="color:#00d97e">🟢 買入 TSLA &nbsp; {layer2_stars}</div>
+      <div class="sig-detail">{layer2_reason}{spy_note}</div>
+    </div>
+    """, unsafe_allow_html=True)
+elif layer2_signal == "SELL_TSLA":
+    st.markdown(f"""
+    <div class="sig-layer2-sell">
+      <div class="sig-title" style="color:#e84045">🔴 賣出 TSLA &nbsp; {layer2_stars}</div>
+      <div class="sig-detail">{layer2_reason}</div>
+    </div>
+    """, unsafe_allow_html=True)
+elif spy_filtered:
+    st.markdown(f"""
+    <div class="sig-layer2-buy" style="opacity:0.5">
+      <div class="sig-title" style="color:#8b8fa8">⛔ 買入訊號已被 SPY 過濾</div>
+      <div class="sig-detail">{layer2_reason}</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+# Layer 1 warning
+if layer1_active:
+    st.markdown(f"""
+    <div class="sig-layer1">
+      <div class="sig-title" style="color:#f6c90e">🟡 預警：TSLA 抵抗力強（Layer 1）</div>
+      <div class="sig-detail">{layer1_reason}<br>
+      <b>UVXY若轉跌，TSLA極可能急升 → 等待Layer 2確認入場</b></div>
+    </div>
+    """, unsafe_allow_html=True)
+
+# Normal state
+if not layer1_active and not layer2_signal and not layer3_exit:
+    uvxy_s = uvxy_trend_1m.get("slope", 0)
+    st.markdown(f"""
+    <div class="sig-normal">
+      <div class="sig-title" style="color:#8b8fa8">⚪ 無訊號</div>
+      <div class="sig-detail">UVXY斜率={uvxy_s:+.3f}%/根　確認={uvxy_trend_1m.get('confirmed','—')}　
+      趨勢未達觸發條件</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+# ── Active signal progress tracker ───────────────────────────────────────────
+if st.session_state.active_signal and st.session_state.active_signal_time:
+    elapsed_min = (now - st.session_state.active_signal_time).total_seconds() / 60
+    remaining   = max(signal_timeout - elapsed_min, 0)
+    bar_pct     = min(elapsed_min / signal_timeout * 100, 100)
+    bar_color   = "#00d97e" if st.session_state.active_signal == "BUY_TSLA" else "#e84045"
+    action_word = "上升" if st.session_state.active_signal == "BUY_TSLA" else "下跌"
+    entry_str   = f"${st.session_state.active_signal_entry:.2f}" if st.session_state.active_signal_entry else "—"
+    t_now_val   = float(tsla_1m["Close"].iloc[-1]) if data_ok else 0
+    pnl_now     = ((t_now_val - (st.session_state.active_signal_entry or t_now_val))
+                   / (st.session_state.active_signal_entry or 1) * 100)
+    pnl_color   = "#00d97e" if pnl_now >= 0 else "#e84045"
+    st.markdown(f"""
+    <div class="track-card">
+      <b style="color:{bar_color}">📡 訊號追蹤中</b>
+      &nbsp;｜&nbsp; 入場價 <b>{entry_str}</b>
+      &nbsp;｜&nbsp; 持倉 <b>{elapsed_min:.0f}</b> 分鐘
+      &nbsp;｜&nbsp; 失效倒數 <b>{remaining:.0f}</b> 分鐘
+      &nbsp;｜&nbsp; 目標：TSLA {action_word} ≥ {min_tsla_response}%
+      &nbsp;｜&nbsp; 即時P&L：<b style="color:{pnl_color}">{pnl_now:+.2f}%</b>
+      <div style="background:#2d3139;border-radius:4px;height:6px;margin-top:8px">
+        <div style="background:{bar_color};width:{bar_pct:.0f}%;height:6px;border-radius:4px"></div>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# METRIC CARDS
+# ═══════════════════════════════════════════════════════════════════════════════
+tsla_price = float(tsla_1m["Close"].iloc[-1]) if data_ok else None
+uvxy_price = float(uvxy_1m["Close"].iloc[-1]) if data_ok else None
+spy_price  = float(spy_1m["Close"].iloc[-1])  if use_spy_filter and not spy_1m.empty else None
+
+def fmt_pct(v):
+    if v is None: return "—"
+    return f"{'▲' if v >= 0 else '▼'} {abs(v):.2f}%"
+def pct_color(v):
+    return "#8b8fa8" if v is None else ("#00d97e" if v >= 0 else "#e84045")
+def slope_color(s):
+    return "#8b8fa8" if abs(s) < 0.05 else ("#00d97e" if s > 0 else "#e84045")
+corr_color = (
+    "#00d97e" if corr_value is not None and corr_value < -0.7 else
+    "#f6c90e" if corr_value is not None and corr_value < -0.5 else "#e84045"
 )
 
-demo.launch()
+def metric_card(col, label, value, color, sub=None, sub_color="#8b8fa8"):
+    sub_html = f'<div class="metric-sub" style="color:{sub_color}">{sub}</div>' if sub else ""
+    with col:
+        st.markdown(f"""
+        <div class="metric-card">
+          <div class="metric-label">{label}</div>
+          <div class="metric-value" style="color:{color}">{value}</div>
+          {sub_html}
+        </div>""", unsafe_allow_html=True)
+
+st.markdown('<div class="section-title">即時指標</div>', unsafe_allow_html=True)
+
+num_cols = 11 if use_spy_filter else 10
+cols = st.columns(num_cols)
+
+metric_card(cols[0], "TSLA 價格",
+            f"${tsla_price:.2f}" if tsla_price else "—", "#5c7cfa",
+            sub=fmt_pct(tsla_trend_1m.get("pct_move")),
+            sub_color=pct_color(tsla_trend_1m.get("pct_move")))
+metric_card(cols[1], "TSLA 1m斜率",
+            f"{tsla_trend_1m.get('slope',0):+.3f}%",
+            slope_color(tsla_trend_1m.get("slope", 0)),
+            sub=f"R²={tsla_trend_1m.get('r2',0):.2f} 連{tsla_trend_1m.get('consecutive',0)}根")
+metric_card(cols[2], "TSLA RSI",
+            f"{tsla_rsi1:.1f}" if tsla_rsi1 else "—",
+            "#e84045" if (tsla_rsi1 or 0) >= rsi_overbought else
+            "#f6c90e" if (tsla_rsi1 or 0) >= rsi_overbought - 10 else "#00d97e",
+            sub="超買⚠️" if (tsla_rsi1 or 0) >= rsi_overbought else "正常")
+metric_card(cols[3], "UVXY 價格",
+            f"${uvxy_price:.2f}" if uvxy_price else "—", "#f6c90e",
+            sub=fmt_pct(uvxy_trend_1m.get("pct_move")),
+            sub_color=pct_color(uvxy_trend_1m.get("pct_move")))
+metric_card(cols[4], "UVXY 1m斜率",
+            f"{uvxy_trend_1m.get('slope',0):+.3f}%",
+            slope_color(uvxy_trend_1m.get("slope", 0)),
+            sub=f"R²={uvxy_trend_1m.get('r2',0):.2f} 連{uvxy_trend_1m.get('consecutive',0)}根")
+metric_card(cols[5], "UVXY 5m斜率",
+            f"{uvxy_trend_5m.get('slope',0):+.3f}%" if uvxy_trend_5m else "—",
+            slope_color(uvxy_trend_5m.get("slope", 0) if uvxy_trend_5m else 0),
+            sub=f"{'✅雙框架' if multi_tf_agree else '⚪單框架'}")
+metric_card(cols[6], "抵抗力比值",
+            f"{res_ratio:.2f}" if uvxy_dir == +1 else "—",
+            "#00d97e" if res_ratio < resistance_thresh else "#8b8fa8",
+            sub=f"門檻<{resistance_thresh}  {'⚡強抵抗' if res_ratio < resistance_thresh else '正常'}")
+metric_card(cols[7], "成交量倍數",
+            f"{tsla_vol_ratio:.1f}×",
+            "#e84045" if tsla_vol_ratio >= vol_spike_mult else "#8b8fa8",
+            sub="爆量⚠️" if tsla_vol_ratio >= vol_spike_mult else "正常")
+metric_card(cols[8], "皮爾森係數",
+            f"{corr_value:.3f}" if corr_value is not None else "—", corr_color)
+metric_card(cols[9], "最後更新", now.strftime("%H:%M:%S"), "#8b8fa8")
+
+if use_spy_filter and spy_price:
+    metric_card(cols[10], "SPY 價格",
+                f"${spy_price:.2f}", "#a78bfa",
+                sub=fmt_pct(spy_trend_1m.get("pct_move") if spy_trend_1m else None),
+                sub_color=pct_color(spy_trend_1m.get("pct_move") if spy_trend_1m else None))
+
+st.markdown("<br>", unsafe_allow_html=True)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CANDLE CHARTS — 1m with regression overlay
+# ═══════════════════════════════════════════════════════════════════════════════
+st.markdown(f'<div class="section-title">1 分鐘 K 線圖（最新 {display_bars} 根）</div>',
+            unsafe_allow_html=True)
+
+if data_ok:
+    tsla_show = tsla_1m.tail(display_bars)
+    uvxy_show = uvxy_1m.tail(display_bars)
+
+    def make_candle_fig(df, title, slope, r2, cu="#00d97e", cd="#e84045"):
+        closes = df["Close"].values.astype(float)
+        x_vals = np.arange(len(closes))
+        s, b, *_ = linregress(x_vals, closes) if len(closes) >= 3 else (0, closes[0], None, None, None)
+        reg_y = [s * xi + b for xi in x_vals]
+        reg_color = "#00d97e" if slope >= 0 else "#e84045"
+        fig = go.Figure()
+        fig.add_trace(go.Candlestick(
+            x=df.index, open=df["Open"], high=df["High"],
+            low=df["Low"], close=df["Close"],
+            increasing_line_color=cu, decreasing_line_color=cd,
+            increasing_fillcolor=cu, decreasing_fillcolor=cd,
+            name=title, showlegend=False,
+        ))
+        fig.add_trace(go.Scatter(
+            x=df.index, y=reg_y, mode="lines",
+            line=dict(color=reg_color, width=2, dash="dot"),
+            name=f"趨勢線 {slope:+.3f}%/根 R²={r2:.2f}",
+        ))
+        fig.update_layout(
+            title=dict(text=f"{title}   斜率={slope:+.3f}%/根   R²={r2:.2f}",
+                       font=dict(size=13, color="#c9cdd8")),
+            paper_bgcolor="#1c1f26", plot_bgcolor="#1c1f26",
+            xaxis=dict(gridcolor="#2d3139", rangeslider=dict(visible=False), color="#8b8fa8"),
+            yaxis=dict(gridcolor="#2d3139", color="#8b8fa8"),
+            legend=dict(font=dict(color="#8b8fa8", size=10), bgcolor="#1c1f26"),
+            margin=dict(l=10, r=10, t=45, b=10), height=320,
+        )
+        return fig
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.plotly_chart(
+            make_candle_fig(tsla_show, f"TSLA  ${tsla_price:.2f}",
+                            tsla_trend_1m.get("slope", 0), tsla_trend_1m.get("r2", 0)),
+            use_container_width=True, config={"displayModeBar": False},
+        )
+    with col2:
+        st.plotly_chart(
+            make_candle_fig(uvxy_show, f"UVXY  ${uvxy_price:.2f}",
+                            uvxy_trend_1m.get("slope", 0), uvxy_trend_1m.get("r2", 0),
+                            cu="#f6c90e", cd="#e84045"),
+            use_container_width=True, config={"displayModeBar": False},
+        )
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 5m CHARTS
+# ═══════════════════════════════════════════════════════════════════════════════
+st.markdown('<div class="section-title">5 分鐘趨勢確認（最新12根 ≈ 60分鐘）</div>',
+            unsafe_allow_html=True)
+
+if not tsla_5m.empty and not uvxy_5m.empty:
+    def make_5m_fig(df, label, slope, color):
+        closes    = df["Close"].tail(12)
+        x_idx     = np.arange(len(closes))
+        s, b, *_  = linregress(x_idx, closes.values.astype(float))
+        reg_y     = [s * xi + b for xi in x_idx]
+        reg_color = "#00d97e" if slope >= 0 else "#e84045"
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=closes.index, y=closes.values,
+            mode="lines+markers", line=dict(color=color, width=2),
+            marker=dict(size=5), name=label,
+        ))
+        fig.add_trace(go.Scatter(
+            x=closes.index, y=reg_y, mode="lines",
+            line=dict(color=reg_color, width=2, dash="dot"),
+            name=f"趨勢 {slope:+.3f}%/根",
+        ))
+        fig.update_layout(
+            title=dict(text=f"{label}  5m  斜率={slope:+.3f}%/根",
+                       font=dict(size=13, color="#c9cdd8")),
+            paper_bgcolor="#1c1f26", plot_bgcolor="#1c1f26",
+            xaxis=dict(gridcolor="#2d3139", color="#8b8fa8"),
+            yaxis=dict(gridcolor="#2d3139", color="#8b8fa8"),
+            legend=dict(font=dict(color="#8b8fa8", size=10), bgcolor="#1c1f26"),
+            margin=dict(l=10, r=10, t=45, b=10), height=230,
+        )
+        return fig
+
+    c5a, c5b = st.columns(2)
+    with c5a:
+        st.plotly_chart(
+            make_5m_fig(tsla_5m, "TSLA 5m",
+                        tsla_trend_5m.get("slope", 0) if tsla_trend_5m else 0, "#5c7cfa"),
+            use_container_width=True, config={"displayModeBar": False},
+        )
+    with c5b:
+        st.plotly_chart(
+            make_5m_fig(uvxy_5m, "UVXY 5m",
+                        uvxy_trend_5m.get("slope", 0) if uvxy_trend_5m else 0, "#f6c90e"),
+            use_container_width=True, config={"displayModeBar": False},
+        )
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PEARSON CORRELATION HISTORY
+# ═══════════════════════════════════════════════════════════════════════════════
+st.markdown('<div class="section-title">歷史皮爾森相關係數</div>', unsafe_allow_html=True)
+
+hist = st.session_state.corr_history
+if isinstance(hist, pd.DataFrame) and len(hist) >= 2:
+    fig_c = go.Figure()
+    fig_c.add_trace(go.Scatter(
+        x=hist["time"], y=hist["corr"],
+        mode="lines+markers", line=dict(color="#5c7cfa", width=2),
+        marker=dict(size=4), fill="tozeroy",
+        fillcolor="rgba(92,124,250,0.08)", name="皮爾森係數",
+    ))
+    fig_c.add_hline(y=-0.5, line_dash="dash", line_color="#f6c90e",
+                    annotation_text="警戒線 −0.5", annotation_font_color="#f6c90e")
+    fig_c.add_hline(y=0, line_dash="dot", line_color="#8b8fa8")
+    fig_c.update_layout(
+        paper_bgcolor="#1c1f26", plot_bgcolor="#1c1f26",
+        xaxis=dict(gridcolor="#2d3139", color="#8b8fa8"),
+        yaxis=dict(gridcolor="#2d3139", color="#8b8fa8", range=[-1.1, 1.1]),
+        legend=dict(font=dict(color="#8b8fa8"), bgcolor="#1c1f26"),
+        margin=dict(l=10, r=10, t=20, b=10), height=190,
+    )
+    st.plotly_chart(fig_c, use_container_width=True, config={"displayModeBar": False})
+else:
+    st.info("📈 累積數據中，稍後顯示走勢圖…")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# AUTO REFRESH
+# ═══════════════════════════════════════════════════════════════════════════════
+if auto_refresh:
+    time.sleep(60)
+    st.cache_data.clear()
+    st.rerun()
