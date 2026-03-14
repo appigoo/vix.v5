@@ -184,6 +184,7 @@ defaults = {
     "last_alert_time":     None,
     "last_warn_time":      None,   # Layer 1 cooldown
     "last_exit_time":      None,   # Layer 3 cooldown
+    "last_hs_alert_time":  None,   # High-sensitivity cooldown
     "signal_history":      [],
     "active_signal":       None,
     "active_signal_time":  None,
@@ -235,6 +236,32 @@ with st.sidebar:
         st.markdown("<div class='spy-off'>○ SPY 過濾已關閉</div>", unsafe_allow_html=True)
 
     st.divider()
+
+    # ── High-Sensitivity Mode ──────────────────────────────────────────────────
+    st.markdown("### ⚡ 高敏感度模式")
+    use_hs_mode = st.toggle(
+        "啟用高敏感度偵測",
+        value=False,
+        help="每分鐘直接比較最新2根K線方向：UVXY升但TSLA未跌，或UVXY跌但TSLA未升，即時發出提醒"
+    )
+    if use_hs_mode:
+        hs_uvxy_min   = st.slider("HS: UVXY最低變動 (%)", 0.05, 1.0, 0.15, step=0.05,
+                                   help="UVXY單根K線需變動超過此幅度才觸發")
+        hs_tsla_max   = st.slider("HS: TSLA最大容許反應 (%)", 0.0, 1.0, 0.10, step=0.05,
+                                   help="TSLA反應低於此幅度視為「未跟隨」")
+        hs_cooldown   = st.slider("HS: 冷卻時間（分鐘）", 1, 10, 2)
+        st.markdown("""
+        <div style='background:#1a1a0a;border:1px solid #f6c90e;border-radius:6px;
+                    padding:8px 10px;font-size:0.76rem;color:#f6c90e;margin-top:4px'>
+        ⚡ 高敏感度：每分鐘偵測單根K線背離<br>
+        噪音較多，適合快速捕捉短暫機會
+        </div>""", unsafe_allow_html=True)
+    else:
+        hs_uvxy_min  = 0.15
+        hs_tsla_max  = 0.10
+        hs_cooldown  = 2
+
+    st.divider()
     auto_refresh = st.toggle("每分鐘自動刷新", value=True)
     if st.button("🔄 立即刷新"):
         st.cache_data.clear()
@@ -269,8 +296,16 @@ spy_badge = (
     "<span class='spy-on'>SPY過濾 ON</span>" if use_spy_filter
     else "<span class='spy-off'>SPY過濾 OFF</span>"
 )
+hs_badge = (
+    "<span style='background:#1a1a0a;border:1px solid #f6c90e;border-radius:5px;"
+    "padding:3px 8px;color:#f6c90e;font-size:0.76rem;font-weight:700'>⚡ 高敏感度 ON</span>"
+    if use_hs_mode else
+    "<span style='background:#1c1f26;border:1px solid #2d3139;border-radius:5px;"
+    "padding:3px 8px;color:#8b8fa8;font-size:0.76rem'>高敏感度 OFF</span>"
+)
 st.markdown(
-    f"<small style='color:#8b8fa8'>預警 → 入場 → 出場 三層架構 · 抵抗力偵測 · 多框架趨勢引擎</small> &nbsp; {spy_badge}",
+    f"<small style='color:#8b8fa8'>預警 → 入場 → 出場 三層架構 · 抵抗力偵測 · 多框架趨勢引擎</small>"
+    f" &nbsp; {spy_badge} &nbsp; {hs_badge}",
     unsafe_allow_html=True,
 )
 st.divider()
@@ -533,6 +568,50 @@ if data_ok:
             st.session_state.active_signal = None
 
     # ──────────────────────────────────────────────────────────────────────────
+    # HIGH-SENSITIVITY MODE — single candle divergence detection
+    # Logic: compare last 2 closes of TSLA and UVXY
+    #   UVXY close[n] > close[n-1]  (UVXY just moved up this minute)
+    #   TSLA close[n] <= close[n-1] + hs_tsla_max%  (TSLA did NOT fall)
+    #   → Alert: SELL TSLA (TSLA should have fallen but didn't)
+    #
+    #   UVXY close[n] < close[n-1]  (UVXY just moved down this minute)
+    #   TSLA close[n] >= close[n-1] - hs_tsla_max%  (TSLA did NOT rise)
+    #   → Alert: BUY TSLA (TSLA should have risen but didn't)
+    # ──────────────────────────────────────────────────────────────────────────
+    hs_signal      = None    # "HS_BUY" | "HS_SELL"
+    hs_reason      = ""
+    hs_uvxy_chg    = 0.0
+    hs_tsla_chg    = 0.0
+
+    if use_hs_mode and len(tsla_1m) >= 2 and len(uvxy_1m) >= 2:
+        # Align last 2 candles
+        common_last2 = tsla_1m.index.intersection(uvxy_1m.index)
+        if len(common_last2) >= 2:
+            t_closes = tsla_1m.loc[common_last2, "Close"].iloc[-2:]
+            u_closes = uvxy_1m.loc[common_last2, "Close"].iloc[-2:]
+
+            hs_tsla_chg = float((t_closes.iloc[-1] - t_closes.iloc[0]) / t_closes.iloc[0] * 100)
+            hs_uvxy_chg = float((u_closes.iloc[-1] - u_closes.iloc[0]) / u_closes.iloc[0] * 100)
+
+            uvxy_up_now   = hs_uvxy_chg >= hs_uvxy_min
+            uvxy_down_now = hs_uvxy_chg <= -hs_uvxy_min
+            tsla_not_fell = hs_tsla_chg >= -hs_tsla_max   # TSLA didn't fall enough
+            tsla_not_rose = hs_tsla_chg <= hs_tsla_max    # TSLA didn't rise enough
+
+            if uvxy_up_now and tsla_not_fell:
+                hs_signal = "HS_SELL"
+                hs_reason = (
+                    f"UVXY本分鐘升 {hs_uvxy_chg:+.3f}%，"
+                    f"TSLA 僅 {hs_tsla_chg:+.3f}%（未跟跌）"
+                )
+            elif uvxy_down_now and tsla_not_rose:
+                hs_signal = "HS_BUY"
+                hs_reason = (
+                    f"UVXY本分鐘跌 {hs_uvxy_chg:+.3f}%，"
+                    f"TSLA 僅 {hs_tsla_chg:+.3f}%（未跟升）"
+                )
+
+    # ──────────────────────────────────────────────────────────────────────────
     # TELEGRAM ALERTS
     # ──────────────────────────────────────────────────────────────────────────
     def cooldown_ok(last_time, minutes):
@@ -614,6 +693,29 @@ if data_ok:
             f"{now.strftime('%H:%M')} 🟣 出場 {layer3_reason[:40]}"
         )
 
+    # High-sensitivity alert
+    if (hs_signal in ("HS_BUY", "HS_SELL")
+            and cooldown_ok(st.session_state.last_hs_alert_time, hs_cooldown)):
+        t_p   = float(tsla_1m["Close"].iloc[-1])
+        u_p   = float(uvxy_1m["Close"].iloc[-1])
+        action_hs = "⚡🟢 買入 TSLA（高敏感）" if hs_signal == "HS_BUY" else "⚡🔴 賣出 TSLA（高敏感）"
+        msg = (
+            f"*{action_hs}*\n"
+            f"━━━━━━━━━━━━━━━━\n"
+            f"時間：`{now.strftime('%Y-%m-%d %H:%M')}`\n"
+            f"模式：高敏感度（單根K線偵測）\n"
+            f"原因：{hs_reason}\n"
+            f"UVXY變動：`{hs_uvxy_chg:+.3f}%`  TSLA變動：`{hs_tsla_chg:+.3f}%`\n"
+            f"TSLA現價：`${t_p:.2f}`  UVXY現價：`${u_p:.2f}`\n"
+            f"⚠️ 高敏感模式噪音較多，請結合趨勢判斷"
+        )
+        send_telegram(msg)
+        st.session_state.last_hs_alert_time = now
+        log = (f"{now.strftime('%H:%M')} "
+               f"{'⚡🟢 HS買TSLA' if hs_signal=='HS_BUY' else '⚡🔴 HS賣TSLA'} "
+               f"UVXY{hs_uvxy_chg:+.2f}% TSLA{hs_tsla_chg:+.2f}%")
+        st.session_state.signal_history.append(log)
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # SIGNAL DISPLAY — THREE LAYERS
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -672,6 +774,39 @@ if not layer1_active and not layer2_signal and not layer3_exit:
       趨勢未達觸發條件</div>
     </div>
     """, unsafe_allow_html=True)
+
+# High-sensitivity signal box (shown below the main signal boxes)
+if use_hs_mode:
+    if hs_signal == "HS_BUY":
+        st.markdown(f"""
+        <div style='border-radius:10px;padding:12px 20px;margin:6px 0;
+                    background:#0a1a14;border:2px dashed #00d97e;text-align:center'>
+          <div style='font-size:1.3rem;font-weight:800;color:#00d97e'>
+              ⚡ 高敏感 — 🟢 買入 TSLA</div>
+          <div style='font-size:0.85rem;color:#c9cdd8;margin-top:4px'>{hs_reason}</div>
+          <div style='font-size:0.75rem;color:#8b8fa8;margin-top:3px'>
+              UVXY {hs_uvxy_chg:+.3f}%　TSLA {hs_tsla_chg:+.3f}%　⚠️ 單根K線，噪音較多</div>
+        </div>
+        """, unsafe_allow_html=True)
+    elif hs_signal == "HS_SELL":
+        st.markdown(f"""
+        <div style='border-radius:10px;padding:12px 20px;margin:6px 0;
+                    background:#1a0a0a;border:2px dashed #e84045;text-align:center'>
+          <div style='font-size:1.3rem;font-weight:800;color:#e84045'>
+              ⚡ 高敏感 — 🔴 賣出 TSLA</div>
+          <div style='font-size:0.85rem;color:#c9cdd8;margin-top:4px'>{hs_reason}</div>
+          <div style='font-size:0.75rem;color:#8b8fa8;margin-top:3px'>
+              UVXY {hs_uvxy_chg:+.3f}%　TSLA {hs_tsla_chg:+.3f}%　⚠️ 單根K線，噪音較多</div>
+        </div>
+        """, unsafe_allow_html=True)
+    elif hs_signal is None and use_hs_mode:
+        st.markdown(f"""
+        <div style='border-radius:10px;padding:10px 20px;margin:6px 0;
+                    background:#111316;border:1px dashed #2d3139;text-align:center'>
+          <div style='font-size:0.9rem;color:#8b8fa8'>
+              ⚡ 高敏感模式監測中…　UVXY={hs_uvxy_chg:+.3f}%　TSLA={hs_tsla_chg:+.3f}%</div>
+        </div>
+        """, unsafe_allow_html=True)
 
 # ── Active signal progress tracker ───────────────────────────────────────────
 if st.session_state.active_signal and st.session_state.active_signal_time:
